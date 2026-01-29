@@ -136,11 +136,15 @@ def load_weight(
     )
 
     start_time = time.perf_counter()
+    '''
     if use_mma:
         import mma
 
         if device.type == "cuda":
+        
             torch.cuda.set_device(device)
+
+    
         mma.init()
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -155,9 +159,49 @@ def load_weight(
             torch.cuda.synchronize(device)
             new_state_dict[k] = gpu_tensor
         state_dict = new_state_dict
+
     else:
         state_dict = {k: v.to(device) for k, v in state_dict.items()}
+    '''
+
+    if use_mma:
+        import mma
+
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
+        # Pre-allocate GPU buffers with PyTorch first, then init MMA and memcpy.
+        # This avoids "invalid resource handle" if MMA init changes CUDA/stream state.
+        cpu_state_dict: Dict[str, torch.Tensor] = {}
+        new_state_dict: Dict[str, torch.Tensor] = {}
+
+        for k, v in state_dict.items():
+            v = v.contiguous()
+            cpu_state_dict[k] = v
+            new_state_dict[k] = torch.empty_like(v, device=device)
+        
+        #start_time = time.perf_counter()
+        mma.init()
+        start_time = time.perf_counter()
+        
+        for k, v in cpu_state_dict.items():
+            gpu_tensor = new_state_dict[k]
+            if v.dtype == torch.bfloat16:
+                cpu_data = v.view(torch.int16).numpy()
+                mma.memcpy(gpu_tensor.view(torch.int16), cpu_data)
+            else:
+                cpu_data = v.numpy()
+                mma.memcpy(gpu_tensor, cpu_data)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        state_dict = new_state_dict
+    else:
+        state_dict = {k: v.to(device) for k, v in state_dict.items()}
+
     elapsed = time.perf_counter() - start_time
+    torch.cuda.set_stream(torch.cuda.default_stream(device))
     logger.info(f"Transfer completed in {elapsed:.2f}s ({total_bytes / elapsed / 1e9:.2f} GB/s)")
     return _merge_state_dict(state_dict)
 
