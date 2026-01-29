@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import glob
-import logging
 import os
 import time
 from typing import Dict
 
 import safetensors
 import torch
-
-logger = logging.getLogger(__name__)
 from huggingface_hub import snapshot_download as hf_snapshot_download
 from minisgl.distributed import get_tp_info
 from minisgl.utils import divide_up
+from minisgl.utils.logger import init_logger
 from modelscope import snapshot_download as ms_snapshot_download
+
+logger = init_logger(__name__)
 from tqdm.asyncio import tqdm
 
 
