@@ -144,8 +144,13 @@ def load_weight(
         mma.init()
         new_state_dict = {}
         for k, v in state_dict.items():
+            v = v.contiguous()
             gpu_tensor = torch.empty_like(v, device=device)
-            mma.memcpy(gpu_tensor, v.numpy())
+            if v.dtype == torch.bfloat16:
+                cpu_data = v.view(torch.int16).numpy()
+            else:
+                cpu_data = v.numpy()
+            mma.memcpy(gpu_tensor, cpu_data)
             torch.cuda.synchronize(device)
             new_state_dict[k] = gpu_tensor
         state_dict = new_state_dict
