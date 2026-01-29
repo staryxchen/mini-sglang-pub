@@ -127,6 +127,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Disable PyNCCL for tensor parallelism.",
     )
 
+    assert ServerArgs.use_mma == False
+    parser.add_argument(
+        "--use-mma",
+        action="store_true",
+        dest="use_mma",
+        help="Use MMA for accelerated CPU-GPU data transfer.",
+    )
+
     parser.add_argument(
         "--host",
         type=str,
