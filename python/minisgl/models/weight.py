@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
+import time
 from typing import Dict
 
 import safetensors
 import torch
+
+logger = logging.getLogger(__name__)
 from huggingface_hub import snapshot_download as hf_snapshot_download
 from minisgl.distributed import get_tp_info
 from minisgl.utils import divide_up
@@ -119,7 +123,17 @@ def load_weight(
     if get_tp_info().size > 1:
         state_dict = _shard_state_dict(state_dict)
 
+    # Log device transfer info
+    total_bytes = sum(v.numel() * v.element_size() for v in state_dict.values())
+    src_device = next(iter(state_dict.values())).device if state_dict else "N/A"
+    logger.info(
+        f"Transferring {len(state_dict)} tensors ({total_bytes / 1e9:.2f} GB) "
+        f"from {src_device} to {device}"
+    )
+    start_time = time.perf_counter()
     state_dict = {k: v.to(device) for k, v in state_dict.items()}
+    elapsed = time.perf_counter() - start_time
+    logger.info(f"Transfer completed in {elapsed:.2f}s ({total_bytes / elapsed / 1e9:.2f} GB/s)")
     return _merge_state_dict(state_dict)
 
 
