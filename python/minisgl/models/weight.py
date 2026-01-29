@@ -147,13 +147,14 @@ def load_weight(
                 v_f32 = v.float()
                 gpu_tensor = torch.empty_like(v_f32, device=device)
                 mma.h2d(gpu_tensor, v_f32.numpy())
+                # Must sync before dtype conversion to ensure h2d completes on mma's internal stream
                 torch.cuda.synchronize(device)
                 new_state_dict[k] = gpu_tensor.to(torch.bfloat16)
             else:
                 gpu_tensor = torch.empty_like(v, device=device)
                 mma.h2d(gpu_tensor, v.numpy())
+                torch.cuda.synchronize(device)
                 new_state_dict[k] = gpu_tensor
-        torch.cuda.synchronize(device)
         state_dict = new_state_dict
     else:
         state_dict = {k: v.to(device) for k, v in state_dict.items()}
