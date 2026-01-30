@@ -140,7 +140,9 @@ class Engine:
         else:
             return {
                 k: v.to(self.dtype)
-                for k, v in load_weight(config.model_path, self.device, config.model_source).items()
+                for k, v in load_weight(
+                    config.model_path, self.device, config.model_source, config.use_mma
+                ).items()
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:

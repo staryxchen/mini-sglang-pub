@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import glob
-import logging
 import os
 import time
 from typing import Dict
 
 import safetensors
 import torch
-
-logger = logging.getLogger(__name__)
 from huggingface_hub import snapshot_download as hf_snapshot_download
 from minisgl.distributed import get_tp_info
 from minisgl.utils import divide_up
+from minisgl.utils.logger import init_logger
 from modelscope import snapshot_download as ms_snapshot_download
+
+logger = init_logger(__name__)
 from tqdm.asyncio import tqdm
 
 
@@ -81,11 +81,15 @@ def _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
 
 
 def load_weight(
-    model_path: str, device: torch.device, source: str = "huggingface"
+    model_path: str,
+    device: torch.device,
+    source: str = "huggingface",
+    use_mma: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
     Unified model weight loading function.
     :param source: "huggingface" or "modelscope"
+    :param use_mma: Use MMA for accelerated CPU-GPU data transfer
     """
     if os.path.isdir(model_path):
         model_folder = model_path
@@ -128,19 +132,46 @@ def load_weight(
     src_device = next(iter(state_dict.values())).device if state_dict else "N/A"
     logger.info(
         f"Transferring {len(state_dict)} tensors ({total_bytes / 1e9:.2f} GB) "
-        f"from {src_device} to {device}"
+        f"from {src_device} to {device} (use_mma={use_mma})"
     )
+
     start_time = time.perf_counter()
-    state_dict = {k: v.to(device) for k, v in state_dict.items()}
+    if use_mma:
+        import mma
+
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k] = torch.empty_like(v, device=device)
+
+        mma.init()
+        for k, v in state_dict.items():
+            gpu_tensor = new_state_dict[k]
+            if v.dtype == torch.bfloat16:
+                cpu_data = v.view(torch.int16).numpy()
+                gpu_tensor = gpu_tensor.view(torch.int16)
+            else:
+                cpu_data = v.numpy()
+            mma.memcpy(gpu_tensor, cpu_data)
+        state_dict = new_state_dict
+        torch.cuda.set_stream(torch.cuda.default_stream(device))
+    else:
+        state_dict = {k: v.to(device) for k, v in state_dict.items()}
     elapsed = time.perf_counter() - start_time
     logger.info(f"Transfer completed in {elapsed:.2f}s ({total_bytes / elapsed / 1e9:.2f} GB/s)")
     return _merge_state_dict(state_dict)
 
 
 # Backward compatibility
-def load_hf_weight(model_path: str, device: torch.device) -> Dict[str, torch.Tensor]:
-    return load_weight(model_path, device, source="huggingface")
+def load_hf_weight(
+    model_path: str, device: torch.device, use_mma: bool = False
+) -> Dict[str, torch.Tensor]:
+    return load_weight(model_path, device, source="huggingface", use_mma=use_mma)
 
 
-def load_ms_weight(model_path: str, device: torch.device) -> Dict[str, torch.Tensor]:
-    return load_weight(model_path, device, source="modelscope")
+def load_ms_weight(
+    model_path: str, device: torch.device, use_mma: bool = False
+) -> Dict[str, torch.Tensor]:
+    return load_weight(model_path, device, source="modelscope", use_mma=use_mma)
