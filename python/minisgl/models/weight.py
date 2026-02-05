@@ -135,7 +135,6 @@ def load_weight(
         f"from {src_device} to {device} (use_mma={use_mma})"
     )
 
-    start_time = time.perf_counter()
     if use_mma:
         import mma
 
@@ -147,6 +146,7 @@ def load_weight(
             new_state_dict[k] = torch.empty_like(v, device=device)
 
         mma.init()
+        start_time = time.perf_counter()
         for k, v in state_dict.items():
             gpu_tensor = new_state_dict[k]
             if v.dtype == torch.bfloat16:
@@ -158,6 +158,7 @@ def load_weight(
         state_dict = new_state_dict
         torch.cuda.set_stream(torch.cuda.default_stream(device))
     else:
+        start_time = time.perf_counter()
         state_dict = {k: v.to(device) for k, v in state_dict.items()}
     elapsed = time.perf_counter() - start_time
     logger.info(f"Transfer completed in {elapsed:.2f}s ({total_bytes / elapsed / 1e9:.2f} GB/s)")
