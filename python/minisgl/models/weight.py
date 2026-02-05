@@ -137,6 +137,7 @@ def load_weight(
 
     if use_mma:
         import mma
+        import numpy as np
 
         if device.type == "cuda":
             torch.cuda.set_device(device)
@@ -154,6 +155,7 @@ def load_weight(
                 gpu_tensor = gpu_tensor.view(torch.int16)
             else:
                 cpu_data = v.numpy()
+            cpu_data = np.ascontiguousarray(cpu_data)
             mma.memcpy(gpu_tensor, cpu_data)
         state_dict = new_state_dict
         torch.cuda.set_stream(torch.cuda.default_stream(device))
