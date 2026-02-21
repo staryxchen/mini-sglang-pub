@@ -84,7 +84,6 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 max_seq_len=metadata.max_seqlen_k,
                 bmm1_scale=self.scale,
                 bmm2_scale=1.0,
-                cum_seq_lens_q=metadata.cu_seqlens_q,
                 kv_layout="NHD",
                 out_dtype=q.dtype,
             )
