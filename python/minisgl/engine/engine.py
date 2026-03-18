@@ -32,8 +32,10 @@ _mma_initialized = False
 def _ensure_mma_init():
     global _mma_initialized
     if not _mma_initialized:
+        t0 = time.perf_counter()
         _mma_lib.init()
         _mma_initialized = True
+        logger.info(f"MMA initialized in {time.perf_counter() - t0:.3f}s")
 
 
 logger = init_logger(__name__)
