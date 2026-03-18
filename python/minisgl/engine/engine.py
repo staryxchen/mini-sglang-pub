@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -16,6 +17,24 @@ from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_sup
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
+
+try:
+    import mma as _mma_lib
+
+    _MMA_AVAILABLE = True
+except ImportError:
+    _mma_lib = None
+    _MMA_AVAILABLE = False
+
+_mma_initialized = False
+
+
+def _ensure_mma_init():
+    global _mma_initialized
+    if not _mma_initialized:
+        _mma_lib.init()
+        _mma_initialized = True
+
 
 logger = init_logger(__name__)
 
@@ -49,7 +68,10 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        t_load_start = time.perf_counter()
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        t_load_end = time.perf_counter()
+        logger.info_rank0(f"Total weight loading took {t_load_end - t_load_start:.2f}s")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -143,7 +165,48 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            if not config.use_mma:
+                return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            else:
+                # MMA-accelerated weight loading
+                if not _MMA_AVAILABLE:
+                    logger.warning(
+                        "MMA requested but not available, falling back to default loading"
+                    )
+                    return {
+                        k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)
+                    }
+
+                _ensure_mma_init()
+
+                # Phase 1: Load all weights to CPU with dtype conversion + pin memory
+                t0 = time.perf_counter()
+                names = []
+                cpu_tensors = []
+                for name, tensor in load_weight(config.model_path, torch.device("cpu")):
+                    cpu_tensors.append(tensor.to(self.dtype).pin_memory())
+                    names.append(name)
+                t1 = time.perf_counter()
+                logger.info_rank0(
+                    f"MMA: CPU load + dtype + pin took {t1 - t0:.2f}s ({len(names)} tensors)"
+                )
+
+                # Phase 2: Pre-allocate GPU tensors
+                gpu_tensors = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
+
+                # Phase 3: Batch H2D transfer via MMA
+                if cpu_tensors:
+                    _mma_lib.batch_h2d(gpu_tensors, cpu_tensors)
+                t2 = time.perf_counter()
+                total_bytes = sum(t.numel() * t.element_size() for t in cpu_tensors)
+                logger.info_rank0(
+                    f"MMA: alloc + batch_h2d took {t2 - t1:.2f}s ({total_bytes / 1e9:.2f} GB)"
+                )
+
+                # Phase 4: Build state dict, release CPU tensors
+                state_dict = dict(zip(names, gpu_tensors))
+                del cpu_tensors
+                return state_dict
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]

@@ -27,6 +27,7 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    use_mma: bool = False  # Use MMA for accelerated CPU-GPU data transfer
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
 
