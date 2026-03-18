@@ -187,10 +187,10 @@ class Engine:
                 # Phase 1: Load weights to CPU, keep original dtype (no conversion)
                 t0 = time.perf_counter()
                 names = []
-                raw_tensors = []
+                cpu_tensors = []
                 total_bytes = 0
                 for name, tensor in load_weight(config.model_path, torch.device("cpu")):
-                    raw_tensors.append(tensor)
+                    cpu_tensors.append(tensor)
                     names.append(name)
                     total_bytes += tensor.numel() * tensor.element_size()
                 t1 = time.perf_counter()
@@ -199,43 +199,27 @@ class Engine:
                     f" ({len(names)} tensors, {total_bytes / 1e9:.2f} GB)"
                 )
 
-                # Phase 2: Allocate a single pinned buffer, copy tensors into slices
-                pinned_buf = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
-                cpu_tensors = []
-                offset = 0
-                for t in raw_tensors:
-                    nbytes = t.numel() * t.element_size()
-                    pinned_t = torch.as_strided(
-                        pinned_buf[offset : offset + nbytes].view(t.dtype), t.shape, t.stride()
-                    )
-                    pinned_t.copy_(t)
-                    cpu_tensors.append(pinned_t)
-                    offset += nbytes
-                del raw_tensors
-                t2 = time.perf_counter()
-                logger.info_rank0(f"MMA: pin buffer + copy took {t2 - t1:.2f}s")
-
                 # Wait for MMA init to complete before using it
                 mma_future.result()
                 mma_executor.shutdown(wait=False)
 
-                # Phase 3: Batch H2D transfer via MMA (original dtype)
+                # Phase 2: Batch H2D transfer via MMA (skip pin_memory, let MMA handle it)
                 gpu_raw = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
                 if cpu_tensors:
                     _mma_lib.batch_h2d(gpu_raw, cpu_tensors)
-                del cpu_tensors, pinned_buf
-                t3 = time.perf_counter()
+                del cpu_tensors
+                t2 = time.perf_counter()
                 logger.info_rank0(
-                    f"MMA: alloc + batch_h2d took {t3 - t2:.2f}s"
-                    f" ({total_bytes / (t3 - t2) / 1e9:.2f} GB/s)"
+                    f"MMA: alloc + batch_h2d took {t2 - t1:.2f}s"
+                    f" ({total_bytes / (t2 - t1) / 1e9:.2f} GB/s)"
                 )
 
-                # Phase 4: Dtype conversion on GPU + build state dict
+                # Phase 3: Dtype conversion on GPU + build state dict
                 state_dict = {name: tensor.to(self.dtype) for name, tensor in zip(names, gpu_raw)}
                 del gpu_raw
-                t4 = time.perf_counter()
-                logger.info_rank0(f"MMA: GPU dtype conversion took {t4 - t3:.2f}s")
-                logger.info_rank0(f"MMA: total pipeline took {t4 - t0:.2f}s")
+                t3 = time.perf_counter()
+                logger.info_rank0(f"MMA: GPU dtype conversion took {t3 - t2:.2f}s")
+                logger.info_rank0(f"MMA: total pipeline took {t3 - t0:.2f}s")
                 return state_dict
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
