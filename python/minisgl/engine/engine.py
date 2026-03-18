@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import time
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
@@ -179,9 +180,12 @@ class Engine:
                         k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)
                     }
 
-                _ensure_mma_init()
+                # Phase 0: Start MMA init in background (overlaps with CPU load)
+                mma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                mma_future = mma_executor.submit(_ensure_mma_init)
 
                 # Phase 1: Load all weights to CPU with dtype conversion + pin memory
+                # (runs in parallel with MMA init)
                 t0 = time.perf_counter()
                 names = []
                 cpu_tensors = []
@@ -193,6 +197,10 @@ class Engine:
                     f"MMA: CPU load + dtype + pin took {t1 - t0:.2f}s ({len(names)} tensors)"
                 )
 
+                # Wait for MMA init to complete before using it
+                mma_future.result()
+                mma_executor.shutdown(wait=False)
+
                 # Phase 2: Pre-allocate GPU tensors
                 gpu_tensors = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
 
@@ -202,7 +210,7 @@ class Engine:
                 t2 = time.perf_counter()
                 total_bytes = sum(t.numel() * t.element_size() for t in cpu_tensors)
                 logger.info_rank0(
-                    f"MMA: alloc + batch_h2d took {t2 - t1:.2f}s ({total_bytes / 1e9:.2f} GB)"
+                    f"MMA: alloc + batch_h2d took {t2 - t1:.2f}s ({total_bytes / 1e9:.2f} GB/s)"
                 )
 
                 # Phase 4: Build state dict, release CPU tensors
