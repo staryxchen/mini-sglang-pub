@@ -73,8 +73,13 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         t_load_start = time.perf_counter()
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        state_dict = self._load_weight_state_dict(config)
+        t_state_dict = time.perf_counter()
+        logger.info_rank0(f"_load_weight_state_dict took {t_state_dict - t_load_start:.2f}s")
+        self.model.load_state_dict(state_dict)
+        del state_dict
         t_load_end = time.perf_counter()
+        logger.info_rank0(f"model.load_state_dict took {t_load_end - t_state_dict:.2f}s")
         logger.info_rank0(f"Total weight loading took {t_load_end - t_load_start:.2f}s")
 
         # ======================= KV cache initialization ========================
@@ -193,13 +198,24 @@ class Engine:
                 state_dict: Dict[str, torch.Tensor] = {}
                 total_bytes = 0
                 total_tensors = 0
+                t_mma_wait = 0.0
+                t_alloc = 0.0
+                t_h2d = 0.0
+                t_merge = 0.0
+                file_idx = 0
 
                 for sharded_batch in load_sharded_by_file(config.model_path):
+                    t_file_start = time.perf_counter()
+
                     # Ensure MMA is ready before the first batch_h2d
                     if mma_future is not None:
                         mma_future.result()
                         mma_executor.shutdown(wait=False)
                         mma_future = None
+                        t_mma_waited = time.perf_counter()
+                        t_mma_wait = t_mma_waited - t_file_start
+                        logger.info_rank0(f"MMA: init wait took {t_mma_wait:.2f}s")
+                        t_file_start = time.perf_counter()  # reset for first file
 
                     names = [name for name, _ in sharded_batch]
                     cpu_tensors = [t for _, t in sharded_batch]
@@ -209,14 +225,31 @@ class Engine:
                     total_tensors += len(cpu_tensors)
 
                     # Batch H2D: mmap views → GPU (only 1/TP data)
+                    t_a = time.perf_counter()
                     gpu_tensors = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
+                    t_b = time.perf_counter()
+                    t_alloc += t_b - t_a
+
                     if cpu_tensors:
                         _mma_lib.batch_h2d(gpu_tensors, cpu_tensors)
+                    t_c = time.perf_counter()
+                    t_h2d += t_c - t_b
 
                     # Merge/stack on GPU (torch.cat/torch.stack — very fast on device)
                     for name, gpu_t in zip(names, gpu_tensors):
                         for final_name, final_t in accumulator.process(name, gpu_t):
                             state_dict[final_name] = final_t.to(self.dtype)
+                    t_d = time.perf_counter()
+                    t_merge += t_d - t_c
+
+                    if file_idx < 3:
+                        logger.info_rank0(
+                            f"MMA: file[{file_idx}] alloc={t_b - t_a:.3f}s"
+                            f" h2d={t_c - t_b:.3f}s merge={t_d - t_c:.3f}s"
+                            f" total={t_d - t_file_start:.3f}s"
+                            f" ({len(cpu_tensors)} tensors)"
+                        )
+                    file_idx += 1
 
                     del gpu_tensors, cpu_tensors
 
@@ -228,6 +261,11 @@ class Engine:
                 logger.info_rank0(
                     f"MMA: GPU-side shard/merge pipeline took {t1 - t0:.2f}s"
                     f" ({total_tensors} tensors, {total_bytes / 1e9:.2f} GB transferred)"
+                )
+                logger.info_rank0(
+                    f"MMA: breakdown: mma_wait={t_mma_wait:.2f}s"
+                    f" alloc={t_alloc:.2f}s h2d={t_h2d:.2f}s merge={t_merge:.2f}s"
+                    f" overhead={t1 - t0 - t_mma_wait - t_alloc - t_h2d - t_merge:.2f}s"
                 )
                 return state_dict
 
