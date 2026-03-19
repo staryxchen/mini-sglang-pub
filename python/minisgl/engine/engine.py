@@ -12,6 +12,7 @@ from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, 
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
+from minisgl.models.weight import MergeAccumulator, load_sharded_by_file
 from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
@@ -180,46 +181,54 @@ class Engine:
                         k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)
                     }
 
-                # Phase 0: Start MMA init in background (overlaps with CPU load)
+                # Phase 0: Start MMA init in background (overlaps with first file mmap read)
                 mma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 mma_future = mma_executor.submit(_ensure_mma_init)
 
-                # Phase 1: Load weights to CPU, keep original dtype (no conversion)
                 t0 = time.perf_counter()
-                names = []
-                cpu_tensors = []
+                accumulator = MergeAccumulator(
+                    num_experts=config.model_config.num_experts,
+                    is_moe=config.model_config.is_moe,
+                )
+                state_dict: Dict[str, torch.Tensor] = {}
                 total_bytes = 0
-                for name, tensor in load_weight(config.model_path, torch.device("cpu")):
-                    cpu_tensors.append(tensor)
-                    names.append(name)
-                    total_bytes += tensor.numel() * tensor.element_size()
+                total_tensors = 0
+
+                for sharded_batch in load_sharded_by_file(config.model_path):
+                    # Ensure MMA is ready before the first batch_h2d
+                    if mma_future is not None:
+                        mma_future.result()
+                        mma_executor.shutdown(wait=False)
+                        mma_future = None
+
+                    names = [name for name, _ in sharded_batch]
+                    cpu_tensors = [t for _, t in sharded_batch]
+
+                    for t in cpu_tensors:
+                        total_bytes += t.numel() * t.element_size()
+                    total_tensors += len(cpu_tensors)
+
+                    # Batch H2D: mmap views → GPU (only 1/TP data)
+                    gpu_tensors = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
+                    if cpu_tensors:
+                        _mma_lib.batch_h2d(gpu_tensors, cpu_tensors)
+
+                    # Merge/stack on GPU (torch.cat/torch.stack — very fast on device)
+                    for name, gpu_t in zip(names, gpu_tensors):
+                        for final_name, final_t in accumulator.process(name, gpu_t):
+                            state_dict[final_name] = final_t.to(self.dtype)
+
+                    del gpu_tensors, cpu_tensors
+
+                # Flush any remaining merge/expert buffers
+                for final_name, final_t in accumulator.flush():
+                    state_dict[final_name] = final_t.to(self.dtype)
+
                 t1 = time.perf_counter()
                 logger.info_rank0(
-                    f"MMA: CPU load took {t1 - t0:.2f}s"
-                    f" ({len(names)} tensors, {total_bytes / 1e9:.2f} GB)"
+                    f"MMA: GPU-side shard/merge pipeline took {t1 - t0:.2f}s"
+                    f" ({total_tensors} tensors, {total_bytes / 1e9:.2f} GB transferred)"
                 )
-
-                # Wait for MMA init to complete before using it
-                mma_future.result()
-                mma_executor.shutdown(wait=False)
-
-                # Phase 2: Batch H2D transfer via MMA (skip pin_memory, let MMA handle it)
-                gpu_raw = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
-                if cpu_tensors:
-                    _mma_lib.batch_h2d(gpu_raw, cpu_tensors)
-                del cpu_tensors
-                t2 = time.perf_counter()
-                logger.info_rank0(
-                    f"MMA: alloc + batch_h2d took {t2 - t1:.2f}s"
-                    f" ({total_bytes / (t2 - t1) / 1e9:.2f} GB/s)"
-                )
-
-                # Phase 3: Dtype conversion on GPU + build state dict
-                state_dict = {name: tensor.to(self.dtype) for name, tensor in zip(names, gpu_raw)}
-                del gpu_raw
-                t3 = time.perf_counter()
-                logger.info_rank0(f"MMA: GPU dtype conversion took {t3 - t2:.2f}s")
-                logger.info_rank0(f"MMA: total pipeline took {t3 - t0:.2f}s")
                 return state_dict
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
