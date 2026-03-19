@@ -202,6 +202,7 @@ class Engine:
                 t_alloc = 0.0
                 t_h2d = 0.0
                 t_merge = 0.0
+                t_dtype = 0.0
                 file_idx = 0
 
                 for sharded_batch in load_sharded_by_file(config.model_path):
@@ -220,25 +221,39 @@ class Engine:
                     names = [name for name, _ in sharded_batch]
                     cpu_tensors = [t for _, t in sharded_batch]
 
+                    batch_bytes = 0
                     for t in cpu_tensors:
-                        total_bytes += t.numel() * t.element_size()
+                        batch_bytes += t.numel() * t.element_size()
+                    total_bytes += batch_bytes
                     total_tensors += len(cpu_tensors)
 
-                    # Batch H2D: mmap views → GPU (only 1/TP data)
+                    # Batch GPU alloc: one contiguous buffer, then split into views
                     t_a = time.perf_counter()
-                    gpu_tensors = [torch.empty_like(t, device=self.device) for t in cpu_tensors]
+                    flat_buf = torch.empty(batch_bytes, dtype=torch.uint8, device=self.device)
+                    gpu_tensors = []
+                    offset = 0
+                    for ct in cpu_tensors:
+                        nbytes = ct.numel() * ct.element_size()
+                        gpu_t = flat_buf[offset : offset + nbytes].view(ct.dtype).reshape(ct.shape)
+                        gpu_tensors.append(gpu_t)
+                        offset += nbytes
                     t_b = time.perf_counter()
                     t_alloc += t_b - t_a
 
+                    # Batch H2D: mmap views → GPU (only 1/TP data)
                     if cpu_tensors:
                         _mma_lib.batch_h2d(gpu_tensors, cpu_tensors)
                     t_c = time.perf_counter()
                     t_h2d += t_c - t_b
 
-                    # Merge/stack on GPU (torch.cat/torch.stack — very fast on device)
+                    # Merge/stack on GPU, then dtype conversion
                     for name, gpu_t in zip(names, gpu_tensors):
                         for final_name, final_t in accumulator.process(name, gpu_t):
-                            state_dict[final_name] = final_t.to(self.dtype)
+                            t_m0 = time.perf_counter()
+                            converted = final_t.to(self.dtype)
+                            t_m1 = time.perf_counter()
+                            t_dtype += t_m1 - t_m0
+                            state_dict[final_name] = converted
                     t_d = time.perf_counter()
                     t_merge += t_d - t_c
 
@@ -251,7 +266,7 @@ class Engine:
                         )
                     file_idx += 1
 
-                    del gpu_tensors, cpu_tensors
+                    del gpu_tensors, cpu_tensors, flat_buf
 
                 # Flush any remaining merge/expert buffers
                 for final_name, final_t in accumulator.flush():
@@ -264,7 +279,8 @@ class Engine:
                 )
                 logger.info_rank0(
                     f"MMA: breakdown: mma_wait={t_mma_wait:.2f}s"
-                    f" alloc={t_alloc:.2f}s h2d={t_h2d:.2f}s merge={t_merge:.2f}s"
+                    f" alloc={t_alloc:.2f}s h2d={t_h2d:.2f}s"
+                    f" merge(cat/stack)={t_merge - t_dtype:.2f}s dtype={t_dtype:.2f}s"
                     f" overhead={t1 - t0 - t_mma_wait - t_alloc - t_h2d - t_merge:.2f}s"
                 )
                 return state_dict
