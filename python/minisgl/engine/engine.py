@@ -188,6 +188,7 @@ class Engine:
 
                 # Phase 0: Start MMA init in background (overlaps with first file mmap read)
                 t_entry = time.perf_counter()
+                logger.info_rank0(f"MMA: module loaded from {_mma_lib.__file__}")
                 mma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 mma_future = mma_executor.submit(_ensure_mma_init)
 
