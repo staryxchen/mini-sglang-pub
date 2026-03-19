@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import glob
-import logging
 import re
 import time
 from typing import Dict, Iterator, Tuple
@@ -9,8 +8,10 @@ from typing import Dict, Iterator, Tuple
 import safetensors
 import torch
 from minisgl.distributed import get_tp_info
-from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
+from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight, init_logger
 from tqdm import tqdm
+
+logger = init_logger(__name__)
 
 _SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
@@ -79,7 +80,6 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
 
-    logger = logging.getLogger(__name__)
     model_folder = download_hf_weight(model_path)
     config = ModelConfig.from_hf(cached_load_hf_config(model_path))
     files = glob.glob(f"{model_folder}/*.safetensors")
