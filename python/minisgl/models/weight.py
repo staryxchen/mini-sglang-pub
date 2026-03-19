@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import glob
+import logging
 import re
+import time
 from typing import Dict, Iterator, Tuple
 
 import safetensors
@@ -77,11 +79,17 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
 
+    logger = logging.getLogger(__name__)
     model_folder = download_hf_weight(model_path)
     config = ModelConfig.from_hf(cached_load_hf_config(model_path))
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+
+    t_total = time.perf_counter()
+    t_shard = 0.0
+    t_merge = 0.0
+    num_tensors = 0
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -92,17 +100,22 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
+                t0 = time.perf_counter()
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
+                t_shard += time.perf_counter() - t0
+                num_tensors += 1
 
+                t0 = time.perf_counter()
                 if (info := _get_merge_info(name)) is None:
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info
                     merge_buf.setdefault(merged_key, {})[slot] = tensor
                     if not all(s in merge_buf[merged_key] for s in all_slots):
+                        t_merge += time.perf_counter() - t0
                         continue
                     parts = [merge_buf[merged_key][s] for s in all_slots]
                     del merge_buf[merged_key]
@@ -113,12 +126,21 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     slots = expert_buf.setdefault(packed_key, {})
                     slots[expert_idx] = out[1]
                     if len(slots) != config.num_experts:
+                        t_merge += time.perf_counter() - t0
                         continue
                     experts = [slots[idx] for idx in range(config.num_experts)]
                     del expert_buf[packed_key]
+                    t_merge += time.perf_counter() - t0
                     yield packed_key, torch.stack(experts, dim=0)
                 else:  # Normal dense model
+                    t_merge += time.perf_counter() - t0
                     yield out[0], out[1]
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
+    t_total = time.perf_counter() - t_total
+    if tp_info.is_primary():
+        logger.info(
+            f"load_weight breakdown ({len(files)} files, {num_tensors} tensors): "
+            f"total={t_total:.2f}s, load+shard={t_shard:.2f}s, merge={t_merge:.2f}s"
+        )
