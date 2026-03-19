@@ -187,10 +187,12 @@ class Engine:
                     }
 
                 # Phase 0: Start MMA init in background (overlaps with first file mmap read)
+                t_entry = time.perf_counter()
                 mma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 mma_future = mma_executor.submit(_ensure_mma_init)
 
                 t0 = time.perf_counter()
+                logger.info_rank0(f"MMA: submit took {t0 - t_entry:.3f}s")
                 accumulator = MergeAccumulator(
                     num_experts=config.model_config.num_experts,
                     is_moe=config.model_config.is_moe,
@@ -209,6 +211,12 @@ class Engine:
                 logger.info_rank0(f"MMA: iterator init took {t_iter_init - t0:.2f}s")
 
                 for sharded_batch in shard_iter:
+                    if file_idx == 0:
+                        t_first_yield = time.perf_counter()
+                        logger.info_rank0(
+                            f"MMA: first file yield took {t_first_yield - t_iter_init:.2f}s"
+                            f" (from t_entry: {t_first_yield - t_entry:.2f}s)"
+                        )
                     t_file_start = time.perf_counter()
 
                     # Ensure MMA is ready before the first batch_h2d
