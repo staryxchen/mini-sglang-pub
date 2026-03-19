@@ -218,26 +218,13 @@ def load_sharded_by_file(
     but are **not** merged or expert-stacked — the caller is responsible for
     feeding them through a ``MergeAccumulator``.
     """
-    import time
-
     from .config import ModelConfig
 
-    t0 = time.perf_counter()
     model_folder = download_hf_weight(model_path)
-    t1 = time.perf_counter()
     config = ModelConfig.from_hf(cached_load_hf_config(model_path))
-    t2 = time.perf_counter()
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
-    t3 = time.perf_counter()
-
-    print(
-        f"[load_sharded_by_file] download={t1 - t0:.3f}s"
-        f" config={t2 - t1:.3f}s glob+tp={t3 - t2:.3f}s"
-        f" files={len(files)}",
-        flush=True,
-    )
 
     for file in tqdm(files, desc="Loading shards", disable=not tp_info.is_primary()):
         batch: List[Tuple[str, torch.Tensor]] = []
