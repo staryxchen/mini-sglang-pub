@@ -64,6 +64,13 @@ class Engine:
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
+        # Start MMA init early so it overlaps with communication + model setup
+        mma_future = None
+        if config.use_mma and _MMA_AVAILABLE and not config.use_dummy_weight:
+            self._mma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            mma_future = self._mma_executor.submit(_ensure_mma_init)
+        self._mma_future = mma_future
+
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
@@ -186,11 +193,10 @@ class Engine:
                         k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)
                     }
 
-                # Phase 0: Start MMA init in background (overlaps with first file mmap read)
+                # Phase 0: MMA init was submitted early in __init__, reuse its future
                 t_entry = time.perf_counter()
                 logger.info_rank0(f"MMA: module loaded from {_mma_lib.__file__}")
-                mma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                mma_future = mma_executor.submit(_ensure_mma_init)
+                mma_future = self._mma_future  # may already be done
 
                 t0 = time.perf_counter()
                 logger.info_rank0(f"MMA: submit took {t0 - t_entry:.3f}s")
@@ -223,7 +229,7 @@ class Engine:
                     # Ensure MMA is ready before the first batch_h2d
                     if mma_future is not None:
                         mma_future.result()
-                        mma_executor.shutdown(wait=False)
+                        self._mma_executor.shutdown(wait=False)
                         mma_future = None
                         t_mma_waited = time.perf_counter()
                         t_mma_wait = t_mma_waited - t_file_start
