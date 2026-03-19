@@ -230,16 +230,18 @@ class Engine:
                     if cpu_tensors:
                         _mma_lib.batch_h2d(gpu_tensors, cpu_tensors)
 
-                    # Merge/stack on GPU, then dtype conversion
+                    # Merge/stack on GPU, then dtype conversion.
+                    # .to() may return self if dtype matches; .clone() ensures
+                    # the tensor is detached from flat_buf so it can be freed.
                     for name, gpu_t in zip(names, gpu_tensors):
                         for final_name, final_t in accumulator.process(name, gpu_t):
-                            state_dict[final_name] = final_t.to(self.dtype)
+                            state_dict[final_name] = final_t.to(self.dtype).clone()
 
                     del gpu_tensors, cpu_tensors, flat_buf
 
                 # Flush any remaining merge/expert buffers
                 for final_name, final_t in accumulator.flush():
-                    state_dict[final_name] = final_t.to(self.dtype)
+                    state_dict[final_name] = final_t.to(self.dtype).clone()
 
                 t1 = time.perf_counter()
                 logger.info_rank0(
